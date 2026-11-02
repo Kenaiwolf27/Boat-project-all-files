@@ -908,9 +908,6 @@ static void readMAVLink() {
                                      (unsigned)trimState, (int)navState,
                                      (int)routeIsMultiWP,
                                      (int)(rmbActive && (millis() - lastRMBms) < RMB_TIMEOUT_MS));
-
-
-
                             sendStatusText(MAV_SEVERITY_DEBUG, rj);
                         }
 #endif
@@ -1051,10 +1048,8 @@ static void enterContourFollow() {
 #endif
 
 #if DEBUG_GUIDED || DEBUG_APPROACH || DEBUG_FOLLOW || DEBUG_SURVEY
-    char depthStr[8];
-    dtostrf(contourTargetDepth_m, 4, 2, depthStr);
     char activMsg[40];
-    snprintf(activMsg, sizeof(activMsg), "CONTOUR FOLLOW: activated %sm", depthStr);
+    snprintf_P(activMsg, sizeof(activMsg), PSTR("CNT:ACT %dm"), (int)(contourTargetDepth_m * 100.0f));
     sendStatusText(MAV_SEVERITY_INFO, activMsg);
 #endif
 }
@@ -1264,9 +1259,6 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
 #if DEBUG_SPEED_TRIM
                             if (speedChanged) {
                                 char dbg[40];
-
-
-
                                 snprintf_P(dbg, sizeof(dbg), PSTR("TRIMC %d,%d,%d"), (int)speedChanged, (int)(commandedSpeed * 100.0f), (int)(lastSentSpeed * 100.0f));
                                 sendStatusText(MAV_SEVERITY_DEBUG, dbg);
                             }
@@ -1935,10 +1927,10 @@ void loop() {
         if (pixhawkMode != lastPm || pixhawkModeKnown != lastPk || (++pmDiv % 30 == 0)) {
             lastPm = pixhawkMode; lastPk = pixhawkModeKnown;
             char st[48];
-            snprintf(st, sizeof(st), "PM%u,%u,%u,%u,%d",
-                     (unsigned)pixhawkMode, (unsigned)pixhawkModeKnown,
-                     (unsigned)lastHbSysid, (unsigned)hbRxCount,
-                     (int)Serial.availableForWrite());
+            snprintf_P(st, sizeof(st), PSTR("PM%u,%u,%u,%u,%d"),
+                       (unsigned)pixhawkMode, (unsigned)pixhawkModeKnown,
+                       (unsigned)lastHbSysid, (unsigned)hbRxCount,
+                       (int)Serial.availableForWrite());
             sendStatusText(MAV_SEVERITY_DEBUG, st);
         }
 #endif
