@@ -117,6 +117,7 @@ static mavlink_message_t mavMsg;
 #define TICK_DIST_MAX_M 5.0f           // clamp per-tick vzdialenosti (GPS skok, navrat z outage)
 static_assert(DITHER_PERIOD_M > TICK_DIST_MAX_M, "DITHER_PERIOD_M musi byt > TICK_DIST_MAX_M, inak wrap ditherPhaseRad nestaci");
 #define FOLLOW_UNCERTAIN_CORR_DEG 20.0f// cap korekcie ked g neplatny alebo dno ploché
+#define FIRST_CROSS_MAX_OFFSET_DEG 60.0f // vyssi strop kym nepride prvy crossing (zahnuta izobata)
 #define LEVER_ARM_M 1.865f             // vzdialenost transduceru ZA polohou Pixhawk (m, pozdĺž osi lode)
 
 // Operational delays and global scaling factors
@@ -1799,13 +1800,15 @@ static void handleContourFollowPhase(uint32_t now) {
             // --- lateral error in meters + atan-bounded correction ---
             float eLat = (fabsf(error) < DEPTH_FLAT_M) ? 0.0f : (error / g);
             float corr = atanf(FOLLOW_K_LAT * eLat) * 57.29577951f;
-            float corrCap = followSlopeValid ? CONTOUR_MAX_OFFSET_DEG : FOLLOW_UNCERTAIN_CORR_DEG;
+            float corrCap = contourLastGoodValid ? (followSlopeValid ? CONTOUR_MAX_OFFSET_DEG : FOLLOW_UNCERTAIN_CORR_DEG)
+                                                 : FIRST_CROSS_MAX_OFFSET_DEG;
             if (corr > corrCap) corr = corrCap;
             if (corr < -corrCap) corr = -corrCap;
 
             float offset = contourKpSigned * corr + offAmp * sinf(ditherPhaseRad);
-            if (offset > CONTOUR_MAX_OFFSET_DEG) offset = CONTOUR_MAX_OFFSET_DEG;
-            if (offset < -CONTOUR_MAX_OFFSET_DEG) offset = -CONTOUR_MAX_OFFSET_DEG;
+            float offsetCap = contourLastGoodValid ? CONTOUR_MAX_OFFSET_DEG : FIRST_CROSS_MAX_OFFSET_DEG;
+            if (offset > offsetCap) offset = offsetCap;
+            if (offset < -offsetCap) offset = -offsetCap;
 
             lastContourOffsetDeg = offset;
             contourHeadingDeg = contourBaseHeadingDeg + offset;
