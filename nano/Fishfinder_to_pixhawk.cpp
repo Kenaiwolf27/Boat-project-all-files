@@ -1,4 +1,3 @@
-
 // na flesh arduina nano pripojeneho k pixhawk je notne nastavit na pixhawk serial port na -1 co je vypnuty!
 
 // ---- Includes & MAVLink Buffer Setup ----
@@ -186,6 +185,8 @@ static_assert(DITHER_PERIOD_M > TICK_DIST_MAX_M, "DITHER_PERIOD_M musi byt > TIC
 #define DEBUG_BREADCRUMB 0   // gates all EEPROM breadcrumb writes (EEPROM wear mitigation) — enable only when diagnosing a crash
 #define DEBUG_LINK 0
 #define DEBUG_NO_VESC 0
+// Debug msg legend: CNT=contour, TRIM=speed trim, TRIMR=trim rejected,
+// VESC=motor, RMB=route msg, DPT=depth, CMD=mavlink, SONAR=sonar
 #include <avr/pgmspace.h>
 
 #if DEBUG_FREE_RAM
@@ -205,7 +206,7 @@ static void checkFreeRam(char tag) {
         minFreeRamSeen = (int16_t)r;
         EEPROM.put(EEPROM_ADDR_MIN_RAM, minFreeRamSeen);
         char dbg[24];
-        snprintf_P(dbg, sizeof(dbg), PSTR("RAM min=%d %c"), r, tag);
+        snprintf_P(dbg, sizeof(dbg), PSTR("RAM %d %c"), r, tag);
         sendStatusText(MAV_SEVERITY_DEBUG, dbg);
     }
 }
@@ -551,7 +552,7 @@ static void handleRMB(char* fields[], uint8_t n) {
             lastDC = destChanged; lastArr = rmbArrived; lastTrg = contourTrigger;
             char dbg[64];
             snprintf_P(dbg, sizeof(dbg),
-                PSTR("RMB dC=%d arr=%d mWP=%d trg=%d id=%s"),
+                PSTR("RMB %d,%d,%d,%d,%s"),
                 (int)destChanged, (int)rmbArrived, (int)routeIsMultiWP,
                 (int)contourTrigger, prevDestWpId);
             sendStatusText(MAV_SEVERITY_DEBUG, dbg);
@@ -586,7 +587,7 @@ static void handleDPT(char* fields[], uint8_t n) {
 #if DEBUG_CONTOUR_TUNING
     {
         char dbg[40];
-        snprintf_P(dbg, sizeof(dbg), PSTR("DPT d=%dcm gl=%dcm cnt=%d acc=%d"),
+        snprintf_P(dbg, sizeof(dbg), PSTR("DPT %d,%d,%d,%d"),
                  (int)(d * 100.0f), (int)(glitch * 100.0f), (int)dptGlitchCount, (int)accept);
         sendStatusText(MAV_SEVERITY_DEBUG, dbg);
     }
@@ -880,9 +881,9 @@ static void readMAVLink() {
 #if DEBUG_SPEED_TRIM
                         {
                             char dbg[40];
-                            char spdStr[8];
-                            dtostrf(spd, 4, 2, spdStr);
-                            snprintf(dbg, sizeof(dbg), "TRIM st=%u mWP=%d spd=%s", (unsigned)trimState, (int)routeIsMultiWP, spdStr);
+
+
+                            snprintf_P(dbg, sizeof(dbg), PSTR("TRIM %u,%d,%d"), (unsigned)trimState, (int)routeIsMultiWP, (int)(spd * 100.0f));
                             sendStatusText(MAV_SEVERITY_DEBUG, dbg);
                         }
 #endif
@@ -894,7 +895,7 @@ static void readMAVLink() {
                                 lastSpeedSendMs = millis();
                                 speedNeedsResend = false;
 #if DEBUG_SPEED_TRIM
-                                sendStatusText_P(MAV_SEVERITY_DEBUG, PSTR("TRIM: sent immediate"));
+                                sendStatusText_P(MAV_SEVERITY_DEBUG, PSTR("TRIM:S"));
 #endif
                             }
                         }
@@ -902,10 +903,10 @@ static void readMAVLink() {
 #if DEBUG_SPEED_TRIM
                         {
                             char rj[48];
-                            snprintf(rj, sizeof(rj), "TRIM REJ st=%u ns=%d mWP=%d rmbF=%d",
-                                     (unsigned)trimState, (int)navState,
-                                     (int)routeIsMultiWP,
-                                     (int)(rmbActive && (millis() - lastRMBms) < RMB_TIMEOUT_MS));
+                            snprintf(rj, sizeof(rj), "TRIMR %u,%d,%d,%d");
+
+
+
                             sendStatusText(MAV_SEVERITY_DEBUG, rj);
                         }
 #endif
@@ -1088,8 +1089,8 @@ static void reenterContourFromLastGood() {
     requestModeChange(ROVER_MODE_GUIDED, millis());
 
 #if DEBUG_FOLLOW || DEBUG_APPROACH
-    sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CONTOUR: line lost -> re-circle"));
-    sendStatusText_P(MAV_SEVERITY_INFO, PSTR("CONTOUR FOLLOW: re-activated"));
+            sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CNT:LOST"));
+            sendStatusText_P(MAV_SEVERITY_INFO, PSTR("CNT:REACT"));
 #endif
 }
 
@@ -1181,7 +1182,7 @@ static void handleVescMonitoring(uint32_t now) {
         vescStaleOrBad = true;
     }
     if (vescStaleOrBad && !vescWasStale) {
-        sendStatusText_P(MAV_SEVERITY_ERROR, PSTR("VESC: no data -> HOLD+DISARM"));
+            sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("VESC:NODATA"));
     }
     vescNotActive = vescStaleOrBad || (vescState != 2);
     bool vescFailsafe = (!vescStaleOrBad && vescState == 4);
@@ -1194,7 +1195,7 @@ static void handleVescMonitoring(uint32_t now) {
         if (!vescDisarmSent && sendDisarm()) {
             vescDisarmSent = true;
             if (vescFailsafe) {
-                sendStatusText_P(MAV_SEVERITY_CRITICAL, PSTR("VESC: FAILSAFE -> DISARM"));
+                sendStatusText_P(MAV_SEVERITY_CRITICAL, PSTR("VESC:FS"));
             }
         }
     }
@@ -1210,7 +1211,7 @@ static void handleModeConfirmFailsafe(uint32_t now) {
             EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_MODE_CONFIRM_TIMEOUT);
 #endif
             holdLatched = true;
-            sendStatusText_P(MAV_SEVERITY_CRITICAL, PSTR("MODE CONFIRM TIMEOUT->HOLD"));
+            sendStatusText_P(MAV_SEVERITY_CRITICAL, PSTR("MODE:TIMEOUT"));
         }
     }
     if (holdLatched && !(pixhawkModeKnown && pixhawkMode == ROVER_MODE_HOLD)) {
@@ -1246,7 +1247,7 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
                         lastSpeedSendMs = now;
                         lastSentSpeed = commandedSpeed;
 #if DEBUG_SPEED_TRIM
-                        sendStatusText_P(MAV_SEVERITY_DEBUG, PSTR("TRIM: resend-flag send"));
+                            sendStatusText_P(MAV_SEVERITY_DEBUG, PSTR("TRIM:RS"));
 #endif
                     }
                 } else {
@@ -1259,10 +1260,10 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
 #if DEBUG_SPEED_TRIM
                             if (speedChanged) {
                                 char dbg[40];
-                                char csStr[8], lsStr[8];
-                                dtostrf(commandedSpeed, 4, 2, csStr);
-                                dtostrf(lastSentSpeed, 4, 2, lsStr);
-                                snprintf(dbg, sizeof(dbg), "TRIM chg=%d cs=%s ls=%s", (int)speedChanged, csStr, lsStr);
+
+
+
+                                snprintf_P(dbg, sizeof(dbg), PSTR("TRIMC %d,%d,%d"), (int)speedChanged, (int)(commandedSpeed * 100.0f), (int)(lastSentSpeed * 100.0f));
                                 sendStatusText(MAV_SEVERITY_DEBUG, dbg);
                             }
 #endif
@@ -1293,19 +1294,19 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
             // Arrived alebo mid-route bez follow-podmienok: LOITER sa nedeje,
             // diagnostika povie co chyba k enterContourFollow
             if (!contourTrigger)
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> FOLLOW n/a (no trg)"));
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMBL:NTRG"));
             else if (!rmbArrived)
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> FOLLOW n/a (no A)"));
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMBL:NOA"));
             else if (!haveDPT)
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> FOLLOW n/a (no DPT)"));
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMBL:NODPT"));
             else if (!haveCurrentPos)
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> FOLLOW n/a (no pos)"));
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMBL:NOPOS"));
             else if (!haveLastLegHeading)
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> FOLLOW n/a (no leg)"));
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMBL:NOLEG"));
             else if (!(havePixhawkHeading || havePixhawkCog))
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> FOLLOW n/a (no hdg)"));
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMBL:NOHDG"));
             else
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> FOLLOW n/a (wait)"));
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMBL:WAIT"));
         }
 #endif
     }
@@ -1367,7 +1368,7 @@ static void handleContourApproachPhase(uint32_t now) {
             EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_SURVEY_ENTER);
 #endif
 #if DEBUG_GUIDED || DEBUG_APPROACH || DEBUG_SURVEY
-            sendStatusText_P(MAV_SEVERITY_INFO, PSTR("CONTOUR: survey phase entered"));
+            sendStatusText_P(MAV_SEVERITY_INFO, PSTR("CNT:SURV"));
 #endif
         } else {
             // WP leg na stred — vyzaduje GUIDED; 178 sa posle raz s targetom
@@ -1473,7 +1474,7 @@ static void handleContourSurveyPhase(uint32_t now) {
 #if DEBUG_CONTOUR_TUNING
                 {
                     char dbg[44];
-                    snprintf_P(dbg, sizeof(dbg), PSTR("XING pe=%d ce=%d sl=%d v=%d n=%d"),
+                    snprintf_P(dbg, sizeof(dbg), PSTR("X %d,%d,%d,%d,%d"),
                              (int)(prevErr * 100.0f), (int)(currErr * 100.0f),
                              (int)(crossSlope * 1000.0f), (int)deepSideValid, (int)depthSlopeCount);
                     sendStatusText(MAV_SEVERITY_DEBUG, dbg);
@@ -1531,7 +1532,7 @@ static void handleContourSurveyPhase(uint32_t now) {
 #if DEBUG_CONTOUR_TUNING
                     {
                         char dbg[44];
-                        snprintf_P(dbg, sizeof(dbg), PSTR("XACC=%d dev=%d side=%d g=%d"),
+                        snprintf_P(dbg, sizeof(dbg), PSTR("XA %d,%d,%d,%d"),
                                  (int)(acceptedA || acceptedB), (int)circleBestDev,
                                  (int)circleBestDeepRight, (int)(circleBestSlope * 1000.0f));
                         sendStatusText(MAV_SEVERITY_DEBUG, dbg);
@@ -1584,7 +1585,7 @@ static void handleContourSurveyPhase(uint32_t now) {
 #if DEBUG_CONTOUR_TUNING
                 {
                     char dbg[44];
-                    snprintf_P(dbg, sizeof(dbg), PSTR("FOLLOW g=%d ret=%d"),
+                    snprintf_P(dbg, sizeof(dbg), PSTR("FW %d,%d"),
                              (int)(followSlope * 1000.0f), (int)followReturnLeg);
                     sendStatusText(MAV_SEVERITY_INFO, dbg);
                 }
@@ -1596,14 +1597,14 @@ static void handleContourSurveyPhase(uint32_t now) {
 #endif
                 requestModeChange(ROVER_MODE_GUIDED, now);
 #if DEBUG_SURVEY || DEBUG_FOLLOW
-                sendStatusText_P(MAV_SEVERITY_INFO, PSTR("CONTOUR: survey done -> follow"));
+                sendStatusText_P(MAV_SEVERITY_INFO, PSTR("CNT:FOLLOW"));
 #endif
             } else {
 #if DEBUG_FREE_RAM
                 checkFreeRam('L');
 #endif
 #if DEBUG_SURVEY
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CONTOUR: lap no cross -> retry"));
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CNT:NOCROSS"));
 #endif
                 // Survey failed to find sufficient gradient, clear accumulators and repeat lap
                 circleAccumAngle = 0.0f;
@@ -1684,7 +1685,7 @@ static void handleContourFollowPhase(uint32_t now) {
                 pivotTicks++;
                 if (followReturnLeg == 2 && pivotTicks > 150) {   // timeout; dh-exit vyssie ma prednost
                     followReturnLeg = 0;
-                    sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CONTOUR: pivot timeout -> follow"));
+                    sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CNT:PIVTMO"));
                     prevPosLat_int = slopePrevLat_int = tLat;
                     prevPosLon_int = slopePrevLon_int = tLon;
                     slopePrevDepth = depth_m;
@@ -1717,7 +1718,7 @@ static void handleContourFollowPhase(uint32_t now) {
 #if DEBUG_CONTOUR_TUNING
                 {
                     char dbg[40];
-                    snprintf_P(dbg, sizeof(dbg), PSTR("G upd g=%d meas=%d"),
+                    snprintf_P(dbg, sizeof(dbg), PSTR("G %d,%d"),
                              (int)(followSlope * 1000.0f), (int)(gMeas * 1000.0f));
                     sendStatusText(MAV_SEVERITY_DEBUG, dbg);
                 }
@@ -1731,7 +1732,7 @@ static void handleContourFollowPhase(uint32_t now) {
 #if DEBUG_CONTOUR_TUNING
                         {
                             char dbg[36];
-                            snprintf_P(dbg, sizeof(dbg), PSTR("SLOPE decay g=%d"), (int)(followSlope * 1000.0f));
+                            snprintf_P(dbg, sizeof(dbg), PSTR("SD %d"), (int)(followSlope * 1000.0f));
                             sendStatusText(MAV_SEVERITY_DEBUG, dbg);
                         }
 #endif
@@ -1763,29 +1764,48 @@ static void handleContourFollowPhase(uint32_t now) {
             // --- crossing detection: unconditional accumulation, debounced accept ---
             crossSinceLast_m += tickDist;
             bool nowBelow = (error < 0.0f);
-            if (nowBelow != wasBelowTarget && crossSinceLast_m >= CROSS_DEBOUNCE_M) {
+            if (nowBelow != wasBelowTarget) {
                 wasBelowTarget = nowBelow;
+                if (crossSinceLast_m >= CROSS_DEBOUNCE_M) {
 #if DEBUG_CONTOUR_TUNING
                 {
                     char dbg[44];
-                    snprintf_P(dbg, sizeof(dbg), PSTR("CROSS h=%d a=%d x=%d"),
+                    snprintf_P(dbg, sizeof(dbg), PSTR("X %d,%d,%d"),
                              (int)contourBaseHeadingDeg, (int)(latAmp * 10.0f), (int)(crossSinceLast_m * 10.0f));
                     sendStatusText(MAV_SEVERITY_DEBUG, dbg);
                 }
 #endif
-                crossSinceLast_m = 0.0f;
-                if (havePixhawkCog) {
-                    float dh = pixhawkCogDeg - contourBaseHeadingDeg;
-                    while (dh > 180.0f) dh -= 360.0f;
-                    while (dh < -180.0f) dh += 360.0f;
-                    contourBaseHeadingDeg += 0.5f * dh;
+                    crossSinceLast_m = 0.0f;
+                    bool tangOk = false;
+                    if (contourLastGoodValid) {
+                        float dN = (float)(tLat - contourLastGoodLat_int) * METERS_PER_INT7_LAT;
+                        float dE = (float)(tLon - contourLastGoodLon_int) * METERS_PER_INT7_LAT * activationCosLat;
+                        if (dN * dN + dE * dE >= 16.0f) {          // gap >= 4m: GPS sum neovlivni tangens
+                            float tang = atan2f(dE, dN) * 57.29577951f;   // bearing: atan2(east, north), 0=N/90=E
+                            float dev = tang - contourBaseHeadingDeg;
+                            while (dev > 180.0f) dev -= 360.0f;
+                            while (dev < -180.0f) dev += 360.0f;
+                            if (dev > 90.0f || dev < -90.0f) { tang += 180.0f; dev += (dev > 0.0f) ? -180.0f : 180.0f; }
+                            if (dev >= -60.0f && dev <= 60.0f) {   // zamietne chord medzi paralelnymi vetvami
+                                contourBaseHeadingDeg = tang;
+                                tangOk = true;
+                            }
+                        }
+                    }
+                    if (!tangOk && havePixhawkCog) {
+                        float dh = pixhawkCogDeg - contourBaseHeadingDeg;
+                        while (dh > 180.0f) dh -= 360.0f;
+                        while (dh < -180.0f) dh += 360.0f;
+                        contourBaseHeadingDeg += 0.5f * dh;
+                    }
                     while (contourBaseHeadingDeg < 0.0f) contourBaseHeadingDeg += 360.0f;
                     while (contourBaseHeadingDeg >= 360.0f) contourBaseHeadingDeg -= 360.0f;
+                    contourLastGoodLat_int = tLat;
+                    contourLastGoodLon_int = tLon;
+                    contourLastGoodHeadingDeg = contourBaseHeadingDeg;
+                    contourLastGoodValid = true;
                 }
-                contourLastGoodLat_int = tLat;
-                contourLastGoodLon_int = tLon;
-                contourLastGoodHeadingDeg = contourBaseHeadingDeg;
-                contourLastGoodValid = true;
+            }
             }
 
             // --- lost detection: no accepted crossing within distance budget ---
@@ -1834,7 +1854,7 @@ static void handleContourFollowState(uint32_t now, bool rmbFresh) {
     if (rmbFresh && !rmbArrived && rmbDestChangedInContour) {
         if (requestModeChange(ROVER_MODE_GUIDED, now)) {
 #if DEBUG_GUIDED || DEBUG_APPROACH || DEBUG_SURVEY || DEBUG_FOLLOW
-            sendStatusText_P(MAV_SEVERITY_INFO, PSTR("CONTOUR: new dest -> guided"));
+            sendStatusText_P(MAV_SEVERITY_INFO, PSTR("CNT:NEWDEST"));
 #endif
             navState = NavState::GUIDED;
             waypointReset = false;
@@ -1856,7 +1876,7 @@ static void handleContourFollowState(uint32_t now, bool rmbFresh) {
         static bool extModeWarned = false;
         if (!extModeWarned) {
             extModeWarned = true;
-            sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CONTOUR: mode changed ext -> GUIDED"));
+            sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CNT:EXTMODE"));
         }
         navState = NavState::GUIDED;
         waypointReset = true;
@@ -1912,7 +1932,7 @@ void loop() {
         if (pixhawkMode != lastPm || pixhawkModeKnown != lastPk || (++pmDiv % 30 == 0)) {
             lastPm = pixhawkMode; lastPk = pixhawkModeKnown;
             char st[48];
-            snprintf(st, sizeof(st), "PM=%u PK=%u SY=%u HB=%u AF=%d",
+            snprintf(st, sizeof(st), "PM%u,%u,%u,%u,%d",
                      (unsigned)pixhawkMode, (unsigned)pixhawkModeKnown,
                      (unsigned)lastHbSysid, (unsigned)hbRxCount,
                      (int)Serial.availableForWrite());
@@ -1955,7 +1975,7 @@ void loop() {
         if (pixhawkModeKnown && (pixhawkMode == ROVER_MODE_GUIDED || pixhawkMode == ROVER_MODE_CIRCLE) && !holdLatched) {
             if (!haveDPT || depth_m < CONTOUR_SAFETY_DEPTH_M) {
                 gotoLoiterReset(BC_SONAR_FAIL);
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("SONAR: shallow/lost -> LOITER"));
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("SONAR:SHALLOW"));
             }
         }
 
