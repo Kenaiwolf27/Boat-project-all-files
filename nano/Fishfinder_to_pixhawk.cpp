@@ -185,8 +185,11 @@ static_assert(DITHER_PERIOD_M > TICK_DIST_MAX_M, "DITHER_PERIOD_M musi byt > TIC
 #define DEBUG_BREADCRUMB 0   // gates all EEPROM breadcrumb writes (EEPROM wear mitigation) — enable only when diagnosing a crash
 #define DEBUG_LINK 0
 #define DEBUG_NO_VESC 0
-// Debug msg legend: CNT=contour, TRIM=speed trim, TRIMR=trim rejected,
-// VESC=motor, RMB=route msg, DPT=depth, CMD=mavlink, SONAR=sonar
+// Debug msg legend (speeds in cm/s, depths in cm):
+//   CNT=contour, TRIM/TRIMC/TRIMR=speed trim (+chg,+rejected), FW=follow,
+//   G/SD=slope update/decay, X=crossing, XI=survey xing, XA=xaccept,
+//   RMB/RMBL=route msg (+latched pair), VESC=motor, DPT=depth,
+//   CMD=mavlink, SONAR=sonar, PM=pending-mode counters
 #include <avr/pgmspace.h>
 
 #if DEBUG_FREE_RAM
@@ -881,8 +884,6 @@ static void readMAVLink() {
 #if DEBUG_SPEED_TRIM
                         {
                             char dbg[40];
-
-
                             snprintf_P(dbg, sizeof(dbg), PSTR("TRIM %u,%d,%d"), (unsigned)trimState, (int)routeIsMultiWP, (int)(spd * 100.0f));
                             sendStatusText(MAV_SEVERITY_DEBUG, dbg);
                         }
@@ -903,7 +904,10 @@ static void readMAVLink() {
 #if DEBUG_SPEED_TRIM
                         {
                             char rj[48];
-                            snprintf(rj, sizeof(rj), "TRIMR %u,%d,%d,%d");
+                            snprintf(rj, sizeof(rj), "TRIMR %u,%d,%d,%d",
+                                     (unsigned)trimState, (int)navState,
+                                     (int)routeIsMultiWP,
+                                     (int)(rmbActive && (millis() - lastRMBms) < RMB_TIMEOUT_MS));
 
 
 
@@ -1182,7 +1186,7 @@ static void handleVescMonitoring(uint32_t now) {
         vescStaleOrBad = true;
     }
     if (vescStaleOrBad && !vescWasStale) {
-            sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("VESC:NODATA"));
+        sendStatusText_P(MAV_SEVERITY_ERROR, PSTR("VESC:NODATA"));
     }
     vescNotActive = vescStaleOrBad || (vescState != 2);
     bool vescFailsafe = (!vescStaleOrBad && vescState == 4);
@@ -1474,7 +1478,7 @@ static void handleContourSurveyPhase(uint32_t now) {
 #if DEBUG_CONTOUR_TUNING
                 {
                     char dbg[44];
-                    snprintf_P(dbg, sizeof(dbg), PSTR("X %d,%d,%d,%d,%d"),
+                    snprintf_P(dbg, sizeof(dbg), PSTR("XI %d,%d,%d,%d,%d"),
                              (int)(prevErr * 100.0f), (int)(currErr * 100.0f),
                              (int)(crossSlope * 1000.0f), (int)deepSideValid, (int)depthSlopeCount);
                     sendStatusText(MAV_SEVERITY_DEBUG, dbg);
@@ -1805,7 +1809,6 @@ static void handleContourFollowPhase(uint32_t now) {
                     contourLastGoodHeadingDeg = contourBaseHeadingDeg;
                     contourLastGoodValid = true;
                 }
-            }
             }
 
             // --- lost detection: no accepted crossing within distance budget ---
