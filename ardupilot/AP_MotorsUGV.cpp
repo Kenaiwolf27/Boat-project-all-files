@@ -20,6 +20,7 @@
 #include <AP_BattMonitor/AP_BattMonitor.h>
 #include <AP_Scheduler/AP_Scheduler.h>
 #include <AP_AHRS/AP_AHRS.h>
+#include <APM_Control/AR_AttitudeControl.h>
 
 #define SERVO_MAX 4500  // This value represents 45 degrees and is just an arbitrary representation of servo max travel.
 
@@ -148,8 +149,8 @@ const AP_Param::GroupInfo AP_MotorsUGV::var_info[] = {
     AP_GROUPINFO("VEC_DEADBAND", 17, AP_MotorsUGV, _vec_deadband, 0.02f),
 
     // @Param: VEC_BLND_THR
-    // @DisplayName: Vectored thrust blend throttle
-    // @Description: Filtered throttle below which the vectored angle blends from direct steering-proportional angle into full atan(); 0 = legacy atan() always
+    // @DisplayName: Vectored thrust filter ramp throttle
+    // @Description: Filtered throttle below which the residual throttle filter (VEC_RESID_TC) is applied at full strength; ramps to zero filtering above this threshold. Legacy name kept for EEPROM compatibility - the steering-angle blend it originally controlled was removed; steering angle is now pure atan2 with a 0.05/0.03 deadband latch
     // @Range: 0.0 1.0
     // @User: Advanced
     AP_GROUPINFO("VEC_BLND_THR", 18, AP_MotorsUGV, _vec_blend_thr, 0.15f),
@@ -265,8 +266,8 @@ const AP_Param::GroupInfo AP_MotorsUGV::var_info[] = {
     AP_GROUPINFO("LOIT_I_DISAG", 35, AP_MotorsUGV, _loit_i_disagree, 0.5f),
 
     // @Param: LOIT_ROT_ANG
-    // @DisplayName: Loiter drift method-1 rotation angle gate
-    // @Description: Vectored-thruster deflection (deg) above which coast drift sampling is blocked. Rotating the hull about its pivot point produces real lateral IMU velocity (v = yaw_rate * pivot_radius) that would be misread as drift.
+    // @DisplayName: DEPRICATED Loit drift metod1 rot ang gate
+    // @Description: deprecated: rotation gate uses yaw rate only Vectored-thruster deflection (deg) above which coast drift sampling is blocked. Rotating the hull about its pivot point produces real lateral IMU velocity (v = yaw_rate * pivot_radius) that would be misread as drift.
     // @Units: deg
     // @Range: 1 90
     // @User: Advanced
@@ -278,7 +279,7 @@ const AP_Param::GroupInfo AP_MotorsUGV::var_info[] = {
     // @Units: deg/s
     // @Range: 1 90
     // @User: Advanced
-    AP_GROUPINFO("LOIT_ROT_RAT", 37, AP_MotorsUGV, _loit_rot_rate_dps, 20.0f),
+    AP_GROUPINFO("LOIT_ROT_RAT", 37, AP_MotorsUGV, _loit_rot_rate_dps, 10.0f),
 
     // @Param: DRIFT_EST_YR
     // @DisplayName: Nav drift estimator yaw rate gate
@@ -525,7 +526,7 @@ void AP_MotorsUGV::vectored_allocate(float fx_req, float n_req, float ground_spe
         // S-shaped ramp (same sin^2 shape as the pivot blend below), not
         // linear: flatter near both ends, steeper mid-transition, so the
         // filter strength doesn't kink at the VEC_BLND_THR boundary
-        const float tc_ratio = constrain_float(fabsf(fx) / _vec_blend_thr, 0.0f, 1.0f);
+        const float tc_ratio = constrain_float(fabsf(_vec_throttle_filt) / _vec_blend_thr, 0.0f, 1.0f);
         const float tc_scale = sq(cosf(tc_ratio * M_PI_2));    // smooth S-shape: slope=0 at both ends, no kink
         resid_tc_scaled *= tc_scale;
     }
@@ -558,7 +559,14 @@ void AP_MotorsUGV::vectored_allocate(float fx_req, float n_req, float ground_spe
         // response - worst-case angle quantization error is 2deg, and it is
         // the only protection here when VEC_RESID_TC=0 (no input filtering)
         const float fold_eps_rad = radians(2.0f);
-        if (_vec_folded) {
+        // fold (reverse thrust) allowed only for genuine aft demand.
+        // fx_filt < -0.05 covers pivot AND idle: no surge demand means
+        // nothing to fold for — prevents latch from braking residue or
+        // persistent small offsets near zero. same threshold as rot-brake.
+        const bool aft_demand = _vec_throttle_filt < -0.05f;
+        if (!aft_demand) {
+            _vec_folded = false;
+        } else if (_vec_folded) {
             // unfold test on the RAW delta: demand must return inside
             // +/-88deg (forward hemisphere) before we stop folding
             if (fabsf(delta) < M_PI_2 - fold_eps_rad) {
@@ -572,26 +580,22 @@ void AP_MotorsUGV::vectored_allocate(float fx_req, float n_req, float ground_spe
         }
         const float atan_angle_rad = constrain_float(delta, -vector_angle_max_rad, vector_angle_max_rad);
 
-        // ported legacy atan-fix (formerly output_regular()-only, VEC_FOSSEN=0
-        // path): near zero throttle, atan2's angle is dominated by noise on
-        // the small steering/throttle ratio (hull roll/pitch, sensor noise).
-        // blend toward a direct angle proportional to steering demand only,
-        // same VEC_BLND_THR threshold/mechanism as the legacy blend, now
-        // applied inside the Fossen allocator instead of being unavailable
-        float direct_angle_rad = constrain_float(_vec_steering_filt, -1.0f, 1.0f) * vector_angle_max_rad;
-        if (is_negative(_vec_throttle_filt)) {
-            direct_angle_rad = -direct_angle_rad;
+        // steering angle: pure atan2 of the (possibly folded) demand vector
+        // pure atan2 allocation: at fx~0 any nonzero n commands +-90deg
+        // (pivot), at speed the angle follows atan2(n,fx) (normal steering).
+        // the n-deadband below is the only anti-jitter layer - it gates the
+        // demand, not the angle. hysteresis (enter 0.05 / exit 0.03) prevents
+        // servo exercise when n_filt hovers at the threshold: log analysis
+        // showed bursts of 0.049<->0.054 crossings at fx=0 (Loiter/Acro
+        // hunting) that would flip the servo 0<->90deg each crossing.
+        // sign flips of n still pass through - those are real demand flips
+        // handled by the pivot coast arm below.
+        if (fabsf(_vec_steering_filt) > 0.05f) {
+            _vec_steer_db_out = true;
+        } else if (fabsf(_vec_steering_filt) < 0.03f) {
+            _vec_steer_db_out = false;
         }
-        float w_lowthr;
-        if (is_positive(_vec_blend_thr)) {
-            // same sin^2 S-curve as the pivot blend (and the VEC_RESID_TC
-            // scaling above), replacing the previous linear ramp
-            const float lowthr_ratio = constrain_float(fabsf(_vec_throttle_filt) / _vec_blend_thr, 0.0f, 1.0f);
-            w_lowthr = sq(cosf(lowthr_ratio * M_PI_2));    // smooth S-shape, same family as the pivot blend
-        } else {
-            w_lowthr = 0.0f;
-        }
-        steering_angle_rad = w_lowthr * direct_angle_rad + (1.0f - w_lowthr) * atan_angle_rad;
+        steering_angle_rad = _vec_steer_db_out ? atan_angle_rad : 0.0f;
 
         // magnitude: fx/cos(delta) generalizes vec_mag to the case where the
         // angle clamp above actually engaged (VEC_ANGLEMAX<90): if delta was
@@ -620,18 +624,40 @@ void AP_MotorsUGV::vectored_allocate(float fx_req, float n_req, float ground_spe
             constrain_float((angle_deg - bld_start_deg) / (bld_end_deg - bld_start_deg), 0.0f, 1.0f) : 1.0f;
         const float w = sq(sinf(angle_ratio * M_PI_2));
         const float pivot_expo = MAX(_vec_yaw_lin_expo, 1.0f);
+        // cruise-model feedforward for pivot throttle:
+        // curve by demanded turn rate (YAW_CRS_THR maps YAW_CRS_RATE deg/s,
+        // 49% -> 16deg/s; ratio uncapped above 1 -> demand past the
+        // calibration point stretches the curve, e.g. 20deg/s ->
+        // 0.49*1.25^expo), not |n| which saturates at 1 and pinned
+        // achievable rate at ~YAW_CRS_RATE (observed ~11-17deg/s plateau at
+        // 20deg/s demand). get_desired_turn_rate() is the already-capped
+        // value (speed-fitted turn-rate curve limits it upstream in
+        // get_steering_out_rate) and returns 0 after 500ms of no controller
+        // calls; |n| fallback keeps thrust nonzero while the I-term still
+        // holds n up mid-pivot.
+        const AR_AttitudeControl *att = AR_AttitudeControl::get_singleton();
+        const float des_rate_dps = (att != nullptr) ?
+            degrees(att->get_desired_turn_rate()) : 0.0f;
+        const float des_rate_rads = radians(des_rate_dps);
         float t_pivot;
         if (is_positive(_yaw_crs_rate_dps) && is_positive(_yaw_crs_thr_pct)) {
-            // rate_ratio: n is already a normalized [-1,1] fraction of full
-            // yaw demand (constrained above), so n=1 IS the YAW_CRS_RATE
-            // calibration point by definition - no unit conversion needed.
-            // (previous version incorrectly divided n by _yaw_crs_rate_dps,
-            // a deg/s value, collapsing rate_ratio toward ~0 even at n=1
-            // and effectively defeating the YAW_CRS_THR ceiling)
-            const float rate_ratio = fabsf(n);
+            const float rate_ratio = is_positive(fabsf(des_rate_dps)) ?
+                fabsf(des_rate_dps) / _yaw_crs_rate_dps : fabsf(n);
             t_pivot = copysignf((_yaw_crs_thr_pct * 0.01f) * powf(rate_ratio, pivot_expo), n);
         } else {
             t_pivot = vec_mag;
+        }
+        // fold pair-consistency: fold transforms the (angle, thrust) PAIR,
+        // not just the angle. copysignf(mag, n) pairs forward thrust with
+        // the demanded (pre-fold) side; if fold flipped the commanded angle
+        // to the opposite stop, thrust must flip to reverse so the torque
+        // sign(angle)*sign(thrust) still equals sign(n). uses the final
+        // blended angle so it stays correct through any blend weight.
+        // |n| guard: below it the pivot term is negligible anyway and the
+        // sign product can hit -0.0 filter noise (steering_angle tiny
+        // negative with n==0 flips vec_mag reverse for a forward demand).
+        if (fabsf(n) > 0.01f) {
+            t_pivot = copysignf(fabsf(t_pivot), steering_angle_rad * n);
         }
         throttle_norm = t_vector * (1.0f - w) + t_pivot * w;
 
@@ -655,49 +681,39 @@ void AP_MotorsUGV::vectored_allocate(float fx_req, float n_req, float ground_spe
             throttle_norm *= brk_asym;
         }
 
-        // rotation brake (Option B, angle-locked): flipping the angle to the
-        // opposite side while the hull is still overshooting the commanded
-        // rotation is the actual failure mode this guards against - a ~15kg
-        // thruster traversing ~1.5s under full load, at the exact moment a
-        // fast corrective reaction is needed, is a net-negative response.
-        // instead: the instant the measured yaw rate opposes the commanded
-        // direction (n) while at/near full deflection, LOCK steering_angle_rad
-        // at its current value - immune to the atan2/direct-angle blend above
-        // and to whatever the steering PID asks for - and brake with reverse
-        // thrust proportional to |n| alone. n (not an approximated rad/s
-        // turn rate) is used deliberately: n is a ratio quantity with no
-        // reliable conversion to a physical rate without pulling in
-        // assumptions (ATC_STR_RAT_MAX, YAW_CRS_RATE/YAW_CRS_THR) that were
-        // calibrated for acceleration, not braking, and n alone is already
-        // sufficient as the proportional weight. the lock releases only once
-        // the measured yaw rate's sign agrees with n again (error crossed
-        // back through zero) - normal steering then resumes from the
-        // then-current n, with no intermediate state to unwind. brk_asym
-        // always applies here: with the angle locked, this thrust can never
-        // land on the "accidentally forward" side the way an unlocked flip
-        // could - it is always genuine counter-rotation reverse thrust.
-        // MOT_VEC_BRK scales the magnitude (0 = brake off). runs whenever the
-        // allocator runs; Manual never reaches this code (bypasses via
-        // _scale_steering=false).
-        // vec_mag >= _vec_deadband guard: without it, pure sensor/filter
-        // noise at near-zero demand could set steering_angle_rad near +-90
-        // via atan2 for one tick and latch the brake on noise alone - the
-        // deadband S-blend below will suppress the *output* either way, but
-        // the latch itself would persist into the next tick without this
-        // side-flip coast trigger: demand flips sign while the previously
-        // commanded angle sat at a stop (or during an active coast window -
-        // restart covers a double-flip mid-transit). fires only with a pure
-        // rotation demand: fx>0.03 means the pivot ended and suppression is
-        // the wrong tool. gated by !_vec_rot_brake_active: during a lock the
-        // servo is held, not transiting, and zeroing throttle would kill the
-        // running brake. pivot-from-rest is safe: last angle is ~0, not a stop
+        // pivot coast arm: pivot is defined by the ALLOCATOR OUTPUT -
+        // the commanded angle at saturation (~+-90deg) - AND by the
+        // surge band (-0.05,+0.03]: reverse demand below -0.05 is the
+        // fold domain, forward demand above +0.03 is normal driving;
+        // neither may arm a pivot coast. fx=0.02 with n->0 is NOT a
+        // pivot (servo near center); fx=0.02 with full n IS (servo
+        // pinned at the stop).
+        // arm requires the servo was at a stop AND the command is
+        // heading to the opposite side:
+        //  (a) flipped: the commanded angle changed sign - at fx~0 the
+        //      command stays saturated through the n_filt sweep and
+        //      jumps stop->stop in one tick, so this is the dominant
+        //      arm path; or
+        //  (b) off_stop && demand_opposite: the command left the stop
+        //      inward while the demand already points to the other
+        //      side - covers non-saturated commands (higher fx, blend
+        //      zone) where the angle sweeps through center instead of
+        //      jumping.
+        // a departure from the stop WITHOUT opposite-side demand
+        // (release decay, pivot->surge ramp) does NOT arm.
+        // one-shot edge, no re-arm: the old level-based re-arm
+        // (sign(n)!=sign(last_angle)) stayed true forever whenever
+        // anything held the servo off-side (fold latch), re-arming
+        // coast every tick and holding throttle at 0 for 20-70s.
+        const bool was_at_stop = fabsf(_vec_last_steering_angle_rad) >= vector_angle_max_rad - 1e-4f;
+        const bool off_stop    = fabsf(steering_angle_rad) < vector_angle_max_rad - 1e-4f;
+        const bool demand_opposite = is_positive(n) != is_positive(_vec_last_steering_angle_rad);
+        const bool flipped = is_positive(steering_angle_rad) != is_positive(_vec_last_steering_angle_rad);
         if (!_vec_rot_brake_active &&
             vec_mag >= _vec_deadband &&
             fabsf(n) > 0.05f &&
-            fabsf(fx) <= 0.03f &&
-            ((fabsf(_vec_last_steering_angle_rad) >= vector_angle_max_rad - 1e-4f &&
-              is_positive(n) != is_positive(_vec_last_steering_angle_rad)) ||
-             (_vec_pivot_coast_ms != 0 && is_positive(n) != is_positive(_vec_last_steering_angle_rad)))) {
+            (_vec_throttle_filt <= 0.03f && _vec_throttle_filt > -0.05f) &&
+            was_at_stop && (flipped || (off_stop && demand_opposite))) {
             _vec_pivot_coast_ms = AP_HAL::millis();
         }
 
@@ -717,12 +733,50 @@ void AP_MotorsUGV::vectored_allocate(float fx_req, float n_req, float ground_spe
         // brake actively accelerate the wrong-direction rotation instead of
         // fighting it. this produced a full 360deg wrong-direction pivot in
         // the field. entry (3 opposed ticks) is unchanged.
+        // brake latch keyed on the DEMAND (des_rate), not on n: after a pivot
+        // release the I-term keeps n on the same side as the rotation for
+        // ~8s (log), so sign(yaw)!=sign(n) never held and the brake stayed
+        // dead through the whole passive runout. three lanes:
+        //   (a) yaw_opposes_des    - rotation opposite the demand
+        //   (b) des_idle           - demand gone (incl. 500ms timeout) with
+        //                          pure-rotation state (fx_filt in the
+        //                          (-0.05,+0.03] pivot band) while the
+        //                          hull still turns. vec_mag/angle gates are
+        //                          deliberately bypassed: post-release n and
+        //                          the servo leave the stop, so those gates
+        //                          can never let this lane in. entry may
+        //                          latch off-stop; the servo slews to the
+        //                          lock side under live reverse thrust -
+        //                          benign, reverse through near-center
+        //                          angles is pure deceleration, no moment.
+        //   (c) yaw_overspeeds_des - measured rotation exceeds demand+3deg/s
+        // two lanes: (a) des_idle - no rotation demand (incl. 500ms timeout),
+        //   fx_filt in (-0.05,+0.03], hull still turning >5deg/s; vec_mag/angle gates
+        //   deliberately bypassed since post-release the servo has left the
+        //   stop. (b) yaw_overspeeds_des - measured |yaw| exceeds |des|+3deg/s
+        //   in the demand direction; keeps deadband + at-stop gates.
+        // opposed-rotation with a demand (flip) is NOT a brake case - the
+        // coast-gated transit handles it; that lane was removed because it
+        // forced a 180deg servo transit under reverse thrust.
+        const bool des_active        = fabsf(des_rate_dps) > 0.5f;
+        const bool des_idle          = !des_active;
+        const bool yaw_opposes_des   = des_active &&
+            (is_positive(yaw_rate_rads) != is_positive(des_rate_rads));
+        // runaway lane (c): rotation overspeeding IN the demanded direction.
+        // !yaw_opposes_des is mandatory, not redundant: |yaw|>|des|+3 alone
+        // also matches rotation opposed to the demand (drift, small-demand
+        // flip) - latching there forces a 180deg servo transit under
+        // reverse thrust, the exact regime the brake exists to prevent.
+        // opposed rotation is handled by normal allocation (its counter-
+        // moment then serves the demand too), or by coast-gated transit.
+        const bool yaw_overspeeds_des = des_active && !yaw_opposes_des &&
+            (fabsf(yaw_rate_rads) > fabsf(des_rate_rads) + radians(3.0f));
         const bool rot_brake_cond =
-            vec_mag >= _vec_deadband &&
-            fabsf(steering_angle_rad) >= vector_angle_max_rad - 1e-4f &&
-            fabsf(n) > 0.05f &&
             fabsf(yaw_rate_rads) > radians(5.0f) &&
-            (is_positive(yaw_rate_rads) != is_positive(n));
+            ((des_idle && _vec_throttle_filt <= 0.03f && _vec_throttle_filt > -0.05f) ||
+             (vec_mag >= _vec_deadband &&
+              fabsf(steering_angle_rad) >= vector_angle_max_rad - 1e-4f &&
+              yaw_overspeeds_des));
 
         if (rot_brake_cond) {
             if (_vec_rot_brake_cnt < 3) {
@@ -734,13 +788,14 @@ void AP_MotorsUGV::vectored_allocate(float fx_req, float n_req, float ground_spe
 
         if (!_vec_rot_brake_active && _vec_rot_brake_cnt >= 3) {
             _vec_rot_brake_cnt = 0;
-            // re-lock on the SAME side as the previous lock proves the earlier
-            // release was premature (servo never crossed center) - end the
-            // transit suppression instantly so the brake can work. a re-lock
-            // on the OPPOSITE side does NOT clear it: the servo still needs
-            // the full VEC_TRN_MS transit window from the original release.
+            // des_idle latch must also clear the coast window: an off-stop
+            // latch (post-release runout) fails the same-side test below
+            // because the servo already left the stop, and the coast block
+            // runs AFTER the brake output - without this the brake would
+            // sit locked at zero throttle for the whole VEC_TRN_MS window.
             if (_vec_pivot_coast_ms != 0 &&
-                is_positive(steering_angle_rad) == is_positive(_vec_rot_brake_angle_rad)) {
+                (des_idle ||
+                 is_positive(steering_angle_rad) == is_positive(_vec_rot_brake_angle_rad))) {
                 _vec_pivot_coast_ms = 0;
             }
             _vec_rot_brake_active = true;
@@ -752,30 +807,41 @@ void AP_MotorsUGV::vectored_allocate(float fx_req, float n_req, float ground_spe
             // overshoot. yaw_rate_rads is the authoritative side indicator
             _vec_rot_brake_angle_rad = copysignf(vector_angle_max_rad, yaw_rate_rads);
         } else if (_vec_rot_brake_active &&
-                   (fabsf(yaw_rate_rads) <= radians(3.0f) || fabsf(fx) > 0.03f)) {
-            // release on EITHER: (a) the overshoot the brake was fighting has
+                   (fabsf(yaw_rate_rads) <= radians(3.0f) || _vec_throttle_filt > 0.03f || _vec_throttle_filt <= -0.05f ||
+                    (des_active && !yaw_opposes_des && !yaw_overspeeds_des))) {
+            // release on ANY of: (a) the overshoot the brake was fighting has
             // actually collapsed - |yaw_rate| back under 3deg/s, below the
             // 5deg/s entry threshold (hysteresis so it doesn't chatter right
             // at the entry line). this is deliberately independent of n/n's sign:
             // n can flip mid-lock (pilot/controller now also wants the
             // wrong-side rotation to continue) and that must NOT be read as
-            // "job done" - or (b) forward/aft demand (fx) has reappeared -
-            // pivot has ended, atan2(n,fx) no longer sits at/near the
-            // +-90deg envelope, so re-triggering the instant this clears is
-            // not possible. fx=0.03 is a wide margin: even at n=1 it already
-            // pulls delta to ~88 deg, well clear of the
-            // vector_angle_max_rad-1e-4 trigger threshold.
+            // "job done" - or (b) surge demand (fx_filt) has left the pivot
+            // band - forward above +0.03 ends the pivot (atan2(n,fx) leaves
+            // the +-90deg envelope), reverse at/below -0.05 hands control to
+            // the fold domain. fx=0.03 is a wide margin: even at n=1 it
+            // already pulls delta to ~88 deg, well clear of the
+            // vector_angle_max_rad-1e-4 trigger threshold. or (c) the demand
+            // has reappeared and now AGREES with the rotation direction while
+            // the hull is not running away - the pilot asked for this same
+            // rotation, so holding the lock would keep braking a commanded
+            // pivot. opposite-side demands keep the latch via yaw_opposes_des.
             _vec_rot_brake_active = false;
 			_vec_rot_brake_cnt = 0;  // stale count during the lock would bypass
                                      // the debounce on re-entry (angle stays
                                      // pinned at the stop so cond keeps counting)
                                      // - each re-latch must re-earn its 3 ticks
-            // start the servo-transit suppression window only on a
-            // yaw-agreement release with no forward demand - the servo is
-            // about to traverse +-90deg through center and any thrust during
-            // that sweep lands partly forward. window length is VEC_TRN_MS;
-            // a side-flip from saturation can also arm it (above)
-            if (fabsf(fx) <= 0.03f) {
+            // start the servo-transit suppression window ONLY when the demand
+            // points to the opposite side of the locked angle with surge
+            // demand inside the pivot band (-0.05,+0.03] - the servo is
+            // about to traverse +-90deg through center
+            // and any thrust during that sweep lands partly forward. a
+            // same-side release needs NO transit (servo stays on the lock
+            // side), so arming the window there would just mute pivot thrust
+            // for the whole VEC_TRN_MS. window length is VEC_TRN_MS; a
+            // side-flip from saturation can also arm it via the side-flip
+            // trigger above (fires on sign(n) vs last steering angle).
+            if (_vec_throttle_filt <= 0.03f && _vec_throttle_filt > -0.05f &&
+                is_positive(n) != is_positive(_vec_rot_brake_angle_rad)) {
                 _vec_pivot_coast_ms = AP_HAL::millis();
             }
         }
@@ -783,18 +849,25 @@ void AP_MotorsUGV::vectored_allocate(float fx_req, float n_req, float ground_spe
         if (_vec_rot_brake_active) {
             steering_angle_rad = _vec_rot_brake_angle_rad;
             const float brake_scale = MAX(_vec_brk_pct, 0.0f) * 0.01f;  // negative param must never flip the brake into forward thrust
-            // brake_frac MAGNITUDE still scales with |n| (more commanded
-            // effort -> proportionally more counter-thrust), but the THRUST
-            // SIGN must be fixed to the locked angle's side, never to n: n
-            // can flip sign mid-lock, and if thrust sign followed it, the
-            // "brake" would start pushing WITH the real (wrong-direction)
-            // rotation instead of against it - this was the root cause of
-            // the observed 360deg wrong-direction pivot. reverse thrust
-            // through _vec_rot_brake_angle_rad (set from yaw_rate_rads at
-            // lock time, i.e. the real overshoot side) always opposes the
-            // actual rotation regardless of what n does while locked.
-            const float brake_frac = fabsf(n) * brake_scale;
-            throttle_norm = copysignf(brake_frac * brk_asym, -_vec_rot_brake_angle_rad);
+            // brake_frac magnitude scales with the measured runaway, not |n|:
+            // after a pivot release n sits on the same side as the rotation
+            // (I-term runout) and says nothing about how hard the hull is
+            // escaping. |yaw|/YAW_CRS_RATE is a unitless runaway ratio capped
+            // at 1 (the D-term semantics the P-only pivot lacks); |n|
+            // fallback only if the calibration param is unset.
+            const float overshoot_ratio = is_positive(_yaw_crs_rate_dps) ?
+                MIN(fabsf(yaw_rate_rads) / radians(_yaw_crs_rate_dps), 1.0f) : fabsf(n);
+            const float brake_frac = overshoot_ratio * brake_scale;
+            // copysignf(frac, -angle) produced FORWARD thrust through the
+            // -90deg locked stop, which the log confirmed as ~99% forward
+            // (matches brake_frac*brk_asym = 0.80*1.24, unreachable via the
+            // 49% t_pivot ceiling) while TurnRate deepened to -24deg/s. the
+            // brake was accelerating the overshoot, not fighting it.
+            // reverse thrust through the locked angle always produces
+            // torque -sign(angle) = -sign(yaw_rate): counter-rotation on
+            // BOTH lock sides. sign(+-angle) variants are each wrong on
+            // one side - only the magnitude matters, sign is fixed.
+            throttle_norm = -fabsf(brake_frac * brk_asym);
         }
 
         // servo-transit suppression: for VEC_TRN_MS after a yaw-agreement
@@ -806,7 +879,7 @@ void AP_MotorsUGV::vectored_allocate(float fx_req, float n_req, float ground_spe
         // at zero. cleared early only by a real fx demand (pivot over) or a
         // same-side re-lock (handled in the trigger branch above)
         if (_vec_pivot_coast_ms != 0) {
-            if (fabsf(fx) > 0.03f ||
+            if (_vec_throttle_filt > 0.03f || _vec_throttle_filt <= -0.05f ||
                 _vec_transit_ms <= 0 ||
                 (AP_HAL::millis() - _vec_pivot_coast_ms) >= (uint32_t)_vec_transit_ms.get()) {
                 _vec_pivot_coast_ms = 0;
@@ -1456,6 +1529,7 @@ void AP_MotorsUGV::output_regular(bool armed, float ground_speed, float steering
         _vec_rot_brake_angle_rad    = 0.0f;   // locked angle má zmysel len počas brake
         _vec_rot_brake_cnt          = 0;      // debounce counter — 3-tick hysteresis by po re-arme mohla dostať head-start
         _vec_folded                 = false;  // fold hysteresis — bez resetu prvý tick po re-arme môže začať foldnutý
+        _vec_steer_db_out           = false;  // deadband latch — bez resetu prvý tick po re-arme môže začať mimo deadbandu
         _vec_throttle_filt          = 0.0f;
         _vec_steering_filt          = 0.0f;
     }

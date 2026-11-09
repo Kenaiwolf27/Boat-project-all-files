@@ -314,7 +314,7 @@ private:
     AP_Float _reverse_delay; // delay in seconds when reversing motor
     AP_Float _batt_power_time_constant;    // Time constant used to limit the battery power
     AP_Float _vec_deadband;    // deadband on total commanded steering/throttle vector magnitude below which the vectored-thrust angle is frozen instead of recalculated, suppressing atan() noise amplification near zero throttle
-    AP_Float _vec_blend_thr;   // filtered throttle (normalised 0~1) below which vectored-thrust steering angle is computed directly/proportionally from steering demand instead of atan(steering/throttle)
+    AP_Float _vec_blend_thr;   // filtered throttle (normalised 0~1) below which the residual throttle filter runs at full strength (cos^2 ramp to zero above); legacy name - the angle blend it controlled was removed, angle is now pure atan2 + deadband latch
     AP_Float _vec_resid_tc;    // time constant (s) of the low-pass filter applied to throttle before it is used to select/blend the vectored-thrust regime
 
     // steering-to-throttle floor tunables (vectored-thrust runaway prevention)
@@ -350,6 +350,7 @@ private:
     float   _vec_rot_brake_angle_rad = 0.0f; // steering angle (rad) locked in at the instant _vec_rot_brake_active was set true
     uint32_t _vec_pivot_coast_ms = 0;     // millis() timestamp of last yaw-agreement brake release; nonzero = post-release transit suppression active
     bool    _vec_folded = false;          // fold hysteresis state: true while the atan2 demand is folded past +/-90deg, prevents chatter at the fold boundary
+    bool    _vec_steer_db_out = false;    // steering deadband latch: true = demand above deadband (enter 0.05 / exit 0.03)
     AP_Int8 _vec_fossen;                  // VEC_FOSSEN: 0 = stock vectored blend + SFL floor/cosine reduction active, 1 = Fossen unified allocator (floor/cosine reduction auto-disabled)
     AP_Float _sfl_pivot_pct;              // SFL_PIVOT: raised floor throttle while yaw error >= SFL_IFRZ
     AP_Float _vec_brk_pct;                // VEC_BRK: rotation-brake reverse thrust scale (%), 0 disables
