@@ -33,7 +33,7 @@ local STEER_HALF_RANGE=500  -- = (SERVOx_MAX - SERVOx_MIN)/2 for steering channe
 local THROTTLE_FUNC=70            -- k_throttle
 local THROTTLE_SAFE_PWM=1500      -- confirmed neutral/stop PWM
 local THROTTLE_OVERRIDE_MS=100    -- re-applied every tick (POLL=5ms), short timeout so a script stall fails safe
-local TEMP_CRIT=7500              -- IMU centi-deg C (75.00C): Pixhawk overtemp -> HOLD + DISARM
+local TEMP_CRIT=75                -- IMU deg C (75.00C): Pixhawk overtemp -> HOLD + DISARM
 local temp_div=0
 local THROTTLE_CHAN=SRV_Channels:find_channel(THROTTLE_FUNC)  -- 0-indexed, resolved once at startup
 if not THROTTLE_CHAN then
