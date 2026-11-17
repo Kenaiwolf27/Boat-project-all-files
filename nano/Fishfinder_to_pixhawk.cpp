@@ -844,7 +844,7 @@ static void readMAVLink() {
 
                 if (circleSpeedPending && newPixhawkMode == ROVER_MODE_CIRCLE && !vescNotActive) {
                     circleSpeedPending = false;
-                    sendSpeedCommand(fishingSpeed);
+                    sendSpeedCommand(1.0f);
                 }
             }
             // Intercepts RC channels to facilitate on-the-fly speed trimming from a radio switch
@@ -867,6 +867,8 @@ static void readMAVLink() {
                     if (trimState != 0 && followReturnLeg != 2 &&
                         (pixhawkMode == ROVER_MODE_GUIDED || pixhawkMode == ROVER_MODE_CIRCLE) &&
                         followReturnLeg != 2 &&
+                        !(navState == NavState::CONTOUR_FOLLOW &&
+                          (contourPhase == ContourPhase::CIRCLE_APPROACH || contourPhase == ContourPhase::CIRCLE_SURVEY)) &&
                         ((navState == NavState::GUIDED && rmbActive && (millis() - lastRMBms) < RMB_TIMEOUT_MS) || navState == NavState::CONTOUR_FOLLOW)) {
 
                         float &spd = (navState == NavState::GUIDED && !routeIsMultiWP) ? travelSpeed : fishingSpeed;
@@ -902,7 +904,8 @@ static void readMAVLink() {
                         }
                     } else {
 #if DEBUG_SPEED_TRIM
-                        {
+                        if (trimState != 0 &&
+                            (navState == NavState::GUIDED || navState == NavState::CONTOUR_FOLLOW)) {
                             char rj[48];
                             snprintf(rj, sizeof(rj), "TRIMR %u,%d,%d,%d",
                                      (unsigned)trimState, (int)navState,
@@ -1359,7 +1362,7 @@ static void handleContourApproachPhase(uint32_t now) {
             contourPhase = ContourPhase::CIRCLE_SURVEY;
             circleSpeedPending = true;
             requestModeChange(ROVER_MODE_CIRCLE, now);
-            if (!vescNotActive) sendSpeedCommand(fishingSpeed);  // 178 hned; dorazi este v GUIDED, nastavi speed_max WP legu — neutralne, lebo WP leg bezi fishingSpeed
+            if (!vescNotActive) sendSpeedCommand(1.0f);  // survey na tvrdo 1.0 m/s
 #if DEBUG_BREADCRUMB
             EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_SURVEY_ENTER);
 #endif
@@ -1373,7 +1376,7 @@ static void handleContourApproachPhase(uint32_t now) {
             } else if (!approachWpSent) {
                 if (sendPositionTarget(activationLat_int, activationLon_int)) {
                     approachWpSent = true;
-                    if (!vescNotActive) sendSpeedCommand(fishingSpeed);
+                    if (!vescNotActive) sendSpeedCommand(0.4f);
                 }
             }
         }
