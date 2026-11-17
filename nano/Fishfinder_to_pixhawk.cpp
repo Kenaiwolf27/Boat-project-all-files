@@ -527,7 +527,7 @@ static void handleRMB(char* fields[], uint8_t n) {
             }
         }
         rmbArrived = true;
-        if (routeIsMultiWP && !followTriggeredForDest && rmbSeenNotArrivedForDest) {
+        if (routeIsMultiWP && !followTriggeredForDest && (rmbSeenNotArrivedForDest || destChanged)) {
             contourTrigger = true;
             followTriggeredForDest = true;
             rmbDestChangedInContour = false;
