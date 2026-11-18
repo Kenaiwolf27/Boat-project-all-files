@@ -121,6 +121,7 @@ void AR_PosControl::update(float dt)
         _desired_speed = _atc.get_desired_speed_accel_limited(0.0f, dt);
         _desired_lat_accel = 0.0f;
         _desired_turn_rate_rads = 0.0f;
+        _stopping = false;
         return;
     }
 
@@ -142,11 +143,24 @@ void AR_PosControl::update(float dt)
     }
 
     // calculation velocity error
-    bool stopping = false;
+    // stopping state with hysteresis: enter when feedforward velocity is
+    // zero and vehicle is within 1m of target, exit beyond 1.2m. prevents
+    // deadlock where a vehicle stopped outside the waypoint radius loses
+    // all steering (lat accel clamped to zero) while the target sits behind
+    const float pos_error = _pos_target_valid ? (_pos_target - curr_pos_NED_m.xy()).length() : FLT_MAX;
+    if (_vel_desired_valid && _vel_desired.is_zero()) {
+        if (!_stopping && pos_error < 1.0f) {
+            _stopping = true;
+        } else if (_stopping && pos_error > 1.2f) {
+            _stopping = false;
+        }
+    } else {
+        _stopping = false;
+    }
+    const bool stopping = _stopping;
     if (_vel_desired_valid) {
         // add target velocity to desired velocity from position error
         _vel_target += _vel_desired;
-        stopping = _vel_desired.is_zero();
     }
 
     // limit velocity to maximum speed
@@ -197,12 +211,18 @@ void AR_PosControl::update(float dt)
     // cornering minimum. _turn_radius / ATC_TURN_MAX_G are left untouched and may
     // still be used elsewhere (e.g. ModeCircle::check_config_speed()); _turn_radius
     // itself becomes an unused private member of AR_PosControl after this change.
-    const float des_speed = vel_target_FR.x;
+    // reverse disabled for this boat: negative forward-back velocity target
+    // (destination behind the hull) is handled by pivoting in place at zero
+    // forward speed until the target is ahead, never by reversing. the
+    // vectored thruster can yaw at zero speed so no forward creep is needed.
+    const float des_speed = MAX(vel_target_FR.x, 0.0f);
     _desired_speed = _atc.get_desired_speed_accel_limited(des_speed, dt);
 
     // calculate turn rate from desired lateral acceleration
-    _desired_lat_accel = stopping ? 0 : accel_target_FR.y;
-    _desired_turn_rate_rads = _atc.get_turn_rate_from_lat_accel(_desired_lat_accel, _desired_speed);
+    // zero lat accel when stopping only if the target is ahead (or dead
+    // ahead); if the target is behind the hull keep steering alive so the
+    // vectored thruster can pivot toward it instead of deadlocking
+    _desired_lat_accel = (stopping && vel_target_FR.x >= 0.0f) ? 0.0f : accel_target_FR.y;
 }
 
 // true if update has been called recently
