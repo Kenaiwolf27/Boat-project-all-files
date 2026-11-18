@@ -575,9 +575,15 @@ void AP_MotorsUGV::vectored_allocate(float fx_req, float n_req, float ground_spe
         if (!aft_demand) {
             _vec_folded = false;
         } else if (_vec_folded) {
-            // unfold test on the RAW delta: demand must return inside
-            // +/-88deg (forward hemisphere) before we stop folding
-            if (fabsf(delta) < M_PI_2 - fold_eps_rad) {
+            // unfold test on the RAW delta: release as soon as the demand
+            // reaches the +/-90deg stop. servo at the stop means fx has
+            // decayed to ~0, i.e. braking is satisfied - unfold flips the
+            // servo to the sign(n) side and the pivot continues forward.
+            // the dead band sits entirely on the aft side (90..92deg):
+            // re-fold additionally requires fx_filt < -0.05, which is
+            // unreachable at delta~90deg (fx~0), so pivot jitter cannot
+            // re-enter the fold.
+            if (fabsf(delta) <= M_PI_2) {
                 _vec_folded = false;
             } else {
                 delta = is_positive(delta) ? (delta - M_PI) : (delta + M_PI);
