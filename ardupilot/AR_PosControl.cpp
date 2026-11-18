@@ -219,10 +219,7 @@ void AR_PosControl::update(float dt)
     _desired_speed = _atc.get_desired_speed_accel_limited(des_speed, dt);
 
     // calculate turn rate from desired lateral acceleration
-    // zero lat accel when stopping only if the target is ahead (or dead
-    // ahead); if the target is behind the hull keep steering alive so the
-    // vectored thruster can pivot toward it instead of deadlocking
-    _desired_lat_accel = (stopping && vel_target_FR.x >= 0.0f) ? 0.0f : accel_target_FR.y;
+    _desired_lat_accel = stopping ? 0 : accel_target_FR.y;
 }
 
 // true if update has been called recently
