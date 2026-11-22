@@ -17,6 +17,7 @@
 #include <AP_Math/AP_Math.h>
 #include <AP_HAL/AP_HAL.h>
 #include "AR_AttitudeControl.h"
+#include <AR_Motors/AP_MotorsUGV.h>
 #include <AP_GPS/AP_GPS.h>
 
 // attitude control default definition
@@ -45,7 +46,6 @@
 #define AR_ATTCONTROL_PITCH_RELAX_RATIO 0.5f        // pitch limit relaxed 2x slower than it is limited
 #define AR_ATTCONTROL_PITCH_LIM_THR_THRESH  0.60    // pitch limiting starts if throttle exceeds 60%
 #define AR_ATTCONTROL_DT                0.02f
-#define AR_ATTCONTROL_TIMEOUT_MS        200
 #define AR_ATTCONTROL_HEEL_SAIL_P       1.0f
 #define AR_ATTCONTROL_HEEL_SAIL_I       0.1f
 #define AR_ATTCONTROL_HEEL_SAIL_D       0.0f
@@ -584,7 +584,7 @@ const AP_Param::GroupInfo AR_AttitudeControl::var_info[] = {
 
     // @Param: _ACC_VEQ
     // @DisplayName: Speed control equilibrium speed
-    // @Description: Equilibrium speed at full throttle in m/s - the speed where propeller thrust equals hydrodynamic drag and acceleration is zero. When set above zero, the acceleration limit applied to the desired-speed ramp varies linearly with speed: full ATC_ACCEL_MAX at 0 m/s, decaying to zero at this speed. This models boat physics where acceleration is highest from standstill and vanishes near hull equilibrium speed. 0 disables the curve (constant ATC_ACCEL_MAX limit as before).
+    // @Description: Equilibrium speed at full throttle in m/s - the speed where propeller thrust equals hydrodynamic drag and acceleration is zero. When set above zero, the acceleration limit applied to the desired-speed ramp varies linearly with speed: full ATC_ACCEL_MAX at 0 m/s, decaying to zero at this speed. This models boat physics where acceleration is highest from standstill and vanishes near hull equilibrium speed. 0 disables the curve (constant ATC_ACCEL_MAX limit as before). Acts as an implicit ceiling on achievable desired speed: the desired-speed ramp converges asymptotically and never arrives, so targets above this value leave a permanent PID error (I-term windup risk). Even targets below it are approached lazily, which keeps a small steady error under ATC_SPEED_I - normal behavior, not a fault. Set above the boat's real equilibrium speed.
     // @Range: 0.0 10.0
     // @Increment: 0.05
     // @Units: m/s
@@ -597,24 +597,25 @@ const AP_Param::GroupInfo AR_AttitudeControl::var_info[] = {
     // @Range: 0.0 1.0
     // @Increment: 0.005
     // @User: Advanced
-    AP_GROUPINFO("_DEC_V2", 19, AR_AttitudeControl, _throttle_decel_v2, 0.07f),
+    AP_GROUPINFO("_DEC_V2", 19, AR_AttitudeControl, _throttle_decel_v2, 0.065f),
 
     // @Param: _DEC_MIN
     // @DisplayName: Speed control minimum deceleration
     // @Description: Minimum deceleration in m/s/s used by the quadratic deceleration curve (ATC_DEC_V2) and by stopping distance planning. Pure coasting drag approaches zero at low speed and the vehicle never fully stops, so this floor keeps the planner finite. Only used when ATC_DEC_V2 is non-zero.
-    // @Range: 0.005 1.0
-    // @Increment: 0.005
+    // @Range: 0.001 1.0
+    // @Increment: 0.001
     // @Units: m/s/s
     // @User: Advanced
-    AP_GROUPINFO("_DEC_MIN", 20, AR_AttitudeControl, _throttle_decel_min, 0.02f),
+    AP_GROUPINFO("_DEC_MIN", 20, AR_AttitudeControl, _throttle_decel_min, 0.005f),
 
     // @Param: _DEC_BRK
-    // @DisplayName: Speed control braking deceleration multiplier
-    // @Description: Multiplier applied to the coasting deceleration curve (ATC_DEC_V2*speed^2 + ATC_DEC_MIN) when braking with reversed motor output (requires ATC_BRAKE=1). Values above 1.0 model reverse propeller thrust adding to hydrodynamic drag. 1.0 = same as coasting, 0 is treated as 1.0. Only used when ATC_DEC_V2 is non-zero.
-    // @Range: 0.0 5.0
-    // @Increment: 0.1
+    // @DisplayName: Speed control braking deceleration addend
+    // @Description: Additional deceleration in m/s/s added to the coasting curve (ATC_DEC_V2*speed^2 + ATC_DEC_MIN) when braking with reversed motor output (requires ATC_BRAKE=1). Models reverse propeller thrust as a roughly constant extra braking force on top of hydrodynamic drag. 0 = same as coasting. Only used when ATC_DEC_V2 is non-zero.
+    // @Range: 0.0 0.5
+    // @Increment: 0.01
+    // @Units: m/s/s
     // @User: Advanced
-    AP_GROUPINFO("_DEC_BRK", 21, AR_AttitudeControl, _throttle_decel_brake_mult, 2.0f),
+    AP_GROUPINFO("_DEC_BRK", 21, AR_AttitudeControl, _throttle_decel_brake_mult, 0.10f),
 
     AP_GROUPEND
 };
@@ -657,15 +658,18 @@ float AR_AttitudeControl::get_steering_out_lat_accel(float desired_accel, bool m
 float AR_AttitudeControl::get_steering_out_heading(float heading_rad, float rate_max_rads, bool motor_limit_left, bool motor_limit_right, float dt)
 {
     // calculate the desired turn rate (in radians) from the angle error (also in radians)
-    float desired_rate = get_turn_rate_from_heading(heading_rad, rate_max_rads);
+    float desired_rate = get_turn_rate_from_heading(heading_rad, rate_max_rads, dt);
 
     return get_steering_out_rate(desired_rate, motor_limit_left, motor_limit_right, dt);
 }
 
 // return a desired turn-rate given a desired heading in radians
-float AR_AttitudeControl::get_turn_rate_from_heading(float heading_rad, float rate_max_rads) const
+float AR_AttitudeControl::get_turn_rate_from_heading(float heading_rad, float rate_max_rads, float dt) const
 {
     const float yaw_error = wrap_PI(heading_rad - AP::ahrs().get_yaw_rad());
+    const float yaw_rate = AP::ahrs().get_yaw_rate_earth();
+    dt = constrain_float(dt, 0.0f, 1.0f);
+    _steer_brake_last_ms = AP_HAL::millis();
 
     // Calculate the desired turn rate (in radians) from the angle error (also in radians)
     float desired_rate = _steer_angle_p.get_p(yaw_error);
@@ -675,14 +679,45 @@ float AR_AttitudeControl::get_turn_rate_from_heading(float heading_rad, float ra
         desired_rate = constrain_float(desired_rate, -rate_max_rads, rate_max_rads);
     }
 
-    // if deceleration limit is provided, ensure rate can be slowed to zero in time to stop at heading_rad (i.e. avoid overshoot)
-    if (is_positive(_steer_decel_max)) {
-        const float steer_decel_rate_max_rads = safe_sqrt(2.0 * fabsf(yaw_error) * radians(_steer_decel_max));
-        desired_rate = constrain_float(desired_rate, -steer_decel_rate_max_rads, steer_decel_rate_max_rads);
-    } else if (is_positive(_steer_accel_max)) {
-        // if no deceleration limit, use acceleration limit
-        const float steer_accel_rate_max_rads = safe_sqrt(2.0 * fabsf(yaw_error) * radians(_steer_accel_max));
-        desired_rate = constrain_float(desired_rate, -steer_accel_rate_max_rads, steer_accel_rate_max_rads);
+    // if deceleration limit is provided, ensure rate can be slowed to zero in time to stop at heading_rad (i.e. avoid overshoot)  
+    if (is_positive(_steer_decel_max)) {  
+        const float steer_decel_rate_max_rads = safe_sqrt(2.0 * fabsf(yaw_error) * radians(_steer_decel_max));  
+        desired_rate = constrain_float(desired_rate, -steer_decel_rate_max_rads, steer_decel_rate_max_rads);  
+    } else if (is_positive(_steer_accel_max)) {  
+        // if no deceleration limit, use acceleration limit  
+        const float steer_accel_rate_max_rads = safe_sqrt(2.0 * fabsf(yaw_error) * radians(_steer_accel_max));  
+        desired_rate = constrain_float(desired_rate, -steer_accel_rate_max_rads, steer_accel_rate_max_rads);  
+    }
+
+    // rotation braking: latch a flag when the hull can no longer stop on the
+    // target with 10% reserve (v^2 = 2*a*d, same profile as the sqrt cap
+    // above). gated to the pivot domain (vectored thrust, servo at a stop)
+    // and to rotation toward the target. enter at 0.9*|err|, clear below
+    // 0.7*|err| (hysteresis) or when the domain/rotation conditions fail.
+    const AP_MotorsUGV *motors = AP_MotorsUGV::get_singleton();
+    const float stop_angle_rad = (motors != nullptr && motors->have_vectored_thrust()) ?
+        radians(MAX(motors->get_vector_angle_max() - 10.0f, 0.0f)) : 0.0f;
+    const bool pivot_domain = is_positive(stop_angle_rad) &&
+        (fabsf(motors->get_vectored_angle_rad()) >= stop_angle_rad);
+    const bool rotating_to_target = is_positive(yaw_rate) == is_positive(yaw_error);
+    const float decel = is_positive(_steer_decel_max) ? _steer_decel_max : _steer_accel_max;
+    const float braking_dist = is_positive(decel) ?
+        (yaw_rate * yaw_rate) / (2.0f * radians(decel)) : 0.0f;
+    if (pivot_domain && rotating_to_target && fabsf(yaw_rate) > radians(1.0f) &&
+        braking_dist >= fabsf(yaw_error) * 0.9f) {
+        _steer_brake_active = true;
+    } else if (!pivot_domain || !rotating_to_target || fabsf(yaw_rate) <= radians(1.0f) ||
+               braking_dist < fabsf(yaw_error) * 0.7f) {
+        _steer_brake_active = false;
+    }
+
+    // while braking, shadow the demand one decel step below the actual rate:
+    // keeps des ~ yaw so the runaway brake's overspeed test stays false, and
+    // hands off smoothly to the P-term when the flag clears. the real
+    // counter-thrust comes from the allocator's brake block, not from this.
+    if (_steer_brake_active) {
+        const float step = radians(MIN(decel, _steer_accel_max)) * dt;
+        desired_rate = yaw_rate - copysignf(step, yaw_rate);
     }
 
     return desired_rate;
@@ -1101,9 +1136,12 @@ float AR_AttitudeControl::get_decel_max_at_speed(float speed, bool braking) cons
     // get_stopping_distance() diverge (integrand ~1/v) even though the ramp is finite
     float decel = _throttle_decel_v2 * sq(speed) + MAX(_throttle_decel_min, 0.005f);
     if (braking && _brake_enable && is_positive(_throttle_decel_brake_mult)) {
-        // reversed motor output adds thrust to hydrodynamic drag
-        decel *= _throttle_decel_brake_mult;
+        // reversed motor output adds a roughly constant braking force on top
+        // of hydrodynamic drag (additive, not multiplicative: measured brake
+        // decel is ~flat vs the quadratic coast curve)
+        decel += _throttle_decel_brake_mult;
     }
+
     return decel;
 }
 
@@ -1151,8 +1189,13 @@ float AR_AttitudeControl::get_desired_speed_accel_limited(float desired_speed, f
     // speed-dependent curves are evaluated at the current desired speed
     float speed_change_max;
     if (fabsf(desired_speed) < fabsf(_desired_speed)) {
-        // slowing down: deceleration curve, reversed-output braking when enabled
-        speed_change_max = get_decel_max_at_speed(_desired_speed, true) * dt;
+        // slowing down: deceleration curve. braking=true only while moving
+        // forward (prev positive): slowing then means counter-thrust via
+        // REVERSED prop, which is what DEC_BRK was tuned for. slowing out of
+        // reverse means forward thrust - a different prop asymmetry DEC_BRK
+        // does not model.
+        speed_change_max = get_decel_max_at_speed(_desired_speed,
+                                                is_positive(_desired_speed)) * dt;
     } else {
         // speeding up: acceleration curve
         speed_change_max = get_accel_max_at_speed(_desired_speed) * dt;

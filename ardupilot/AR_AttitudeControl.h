@@ -1,8 +1,11 @@
 #pragma once
 
 #include <AP_Common/AP_Common.h>
+#include <AP_HAL/AP_HAL.h>
 #include <AC_PID/AC_PID.h>
 #include <AC_PID/AC_P.h>
+
+#define AR_ATTCONTROL_TIMEOUT_MS        200
 
 class AR_AttitudeControl {
 public:
@@ -31,7 +34,7 @@ public:
 
     // return a desired turn-rate given a desired heading in radians
     // normally the results are later passed into get_steering_out_rate
-    float get_turn_rate_from_heading(float heading_rad, float rate_max_rads) const;
+    float get_turn_rate_from_heading(float heading_rad, float rate_max_rads, float dt) const;
 
     // return a steering servo output given a desired yaw rate in radians/sec.
     // positive yaw is to the right
@@ -41,6 +44,15 @@ public:
 
     // get latest desired turn rate in rad/sec recorded during calls to get_steering_out_rate.  For reporting purposes only
     float get_desired_turn_rate() const;
+
+    // true while the heading controller requests rotation braking (pivot
+    // domain, hull rotating toward target, braking distance >= 90% of
+    // remaining error). watchdog: cleared if the controller stops calling
+    // get_turn_rate_from_heading for >200ms (mode change, disarm).
+    bool get_steer_brake_active() const {
+        return _steer_brake_active &&
+               (AP_HAL::millis() - _steer_brake_last_ms) < AR_ATTCONTROL_TIMEOUT_MS;
+    }
 
     // get latest desired lateral acceleration in m/s/s recorded during calls to get_steering_out_lat_accel.  For reporting purposes only
     float get_desired_lat_accel() const;
@@ -129,7 +141,7 @@ public:
     float get_accel_max_at_speed(float speed) const;
 
     // get speed-dependent deceleration limit in m/s/s for the given speed (m/s).
-    // quadratic curve _throttle_decel_v2*speed^2 + _throttle_decel_min, multiplied by _throttle_decel_brake_mult when braking; falls back to get_decel_max() when _throttle_decel_v2 is zero
+    // quadratic curve _throttle_decel_v2*speed^2 + _throttle_decel_min, plus _throttle_decel_brake_mult added when braking; falls back to get_decel_max() when _throttle_decel_v2 is zero
     float get_decel_max_at_speed(float speed, bool braking) const;
 
     // check if speed controller active
@@ -175,7 +187,7 @@ private:
     AP_Float _throttle_accel_veq;   // equilibrium speed (m/s) for speed-dependent acceleration limit. 0 = constant limit
     AP_Float _throttle_decel_v2;    // quadratic coefficient of speed-dependent deceleration limit. 0 = constant limit
     AP_Float _throttle_decel_min;   // minimum deceleration floor for the quadratic deceleration curve (m/s/s)
-    AP_Float _throttle_decel_brake_mult; // multiplier of deceleration curve when braking with reversed output (ATC_BRAKE=1)
+    AP_Float _throttle_decel_brake_mult; // additive deceleration (m/s/s) when braking with reversed output (ATC_BRAKE=1)
     AP_Int8  _brake_enable;         // speed control brake enable/disable. if set to 1 a reversed output to the motors to slow the vehicle.
     AP_Float _stop_speed;           // speed control stop speed.  Motor outputs to zero once vehicle speed falls below this value
     AP_Float _steer_accel_max;      // steering angle acceleration max in deg/s/s
@@ -187,7 +199,9 @@ private:
     uint32_t _steer_lat_accel_last_ms;  // system time of last call to lateral acceleration controller (i.e. get_steering_out_lat_accel)
     uint32_t _steer_turn_last_ms;   // system time of last call to steering rate controller
     float    _desired_lat_accel;    // desired lateral acceleration (in m/s/s) from latest call to get_steering_out_lat_accel (for reporting purposes)
-    float    _desired_turn_rate;    // desired turn rate (in radians/sec) either from external caller or from lateral acceleration controller
+    float   _desired_turn_rate;     // latest desired turn rate (rad/sec) from turn rate controller
+    mutable bool     _steer_brake_active = false;   // set inside const get_turn_rate_from_heading
+    mutable uint32_t _steer_brake_last_ms = 0;      // last call timestamp for the watchdog
     bool     _steering_limit_left;  // true when the steering control has reached its left limit (e.g. motor has reached limits or accel or turn rate limits applied)
     bool     _steering_limit_right; // true when the steering control has reached its right limit (e.g. motor has reached limits or accel or turn rate limits applied)
 
